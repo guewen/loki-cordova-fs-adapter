@@ -2,38 +2,110 @@ class LokiCordovaFSAdapterError extends Error {}
 
 const TAG = "[LokiCordovaFSAdapter]";
 
+class SaveState {
+
+    constructor() {
+        this.nextData = null;
+        this.callbacks = [];
+        this.nextCallbacks = [];
+        this._lock = false;
+    }
+
+    lock() {
+        this._lock = true;
+    }
+
+    unlock() {
+        this._lock = false;
+    }
+
+    isLocked() {
+        return this._lock;
+    }
+
+    postpone(data, callback) {
+        // only the last data matters
+        this.nextData = data;
+        this.nextCallbacks.push(callback);
+    }
+
+    next() {
+      var data = this.nextData;
+
+      this.callbacks = this.nextCallbacks;
+
+      this.nextData = null;
+      this.nextCallbacks = [];
+
+      return [data, this.callbacks.pop()];
+    }
+
+}
+
 class LokiCordovaFSAdapter {
     constructor(options) {
         this.options = options;
+        this.saveStates = {};
+    }
+
+    getSaveState(dbname) {
+        if (!this.saveStates[dbname]) {
+            this.saveStates[dbname] = new SaveState();
+        }
+        return this.saveStates[dbname];
     }
 
     saveDatabase(dbname, dbstring, callback) {
-        console.log(TAG, "saving database");
-        this._getFile(dbname,
-            (fileEntry) => {
-                fileEntry.createWriter(
-                    (fileWriter) => {
-                        fileWriter.onwriteend = () => {
-                            if (fileWriter.length === 0) {
-                                var blob = this._createBlob(dbstring, "text/plain");
-                                fileWriter.write(blob);
-                                callback();
-                            }
-                        };
-                        fileWriter.truncate(0);
 
-                    },
-                    (err) => {
-                        console.error(TAG, "error writing file", err);
-                        throw new LokiCordovaFSAdapterError("Unable to write file" + JSON.stringify(err));
-                    }
-                );
-            },
-            (err) => {
-                console.error(TAG, "error getting file", err);
-                throw new LokiCordovaFSAdapterError("Unable to get file" + JSON.stringify(err));
-            }
-        );
+        var saveState = this.getSaveState(dbname);
+
+        if (saveState.isLocked()) {
+
+            console.log(TAG, "save database already running, postponing");
+            saveState.postpone(dbstring, callback);
+
+        } else {
+            saveState.lock(dbname);
+            console.log(TAG, "saving database");
+
+            this._getFile(dbname,
+                (fileEntry) => {
+                    fileEntry.createWriter(
+                        (fileWriter) => {
+                            fileWriter.onwriteend = () => {
+                                if (fileWriter.length === 0) {
+                                    var blob = this._createBlob(dbstring, "text/plain");
+                                    fileWriter.write(blob);
+                                    // call all previously defined callbacks and the current one
+                                    while (saveState.callbacks.length) {
+                                        saveState.callbacks.shift()();
+                                    }
+                                    callback();
+
+                                    saveState.unlock();
+
+                                    var data, cb = saveState.next();
+                                    if (data) {
+                                        this.saveDatabase(dbname, data, cb)
+                                    }
+                                }
+                            };
+                            fileWriter.truncate(0);
+                        },
+                        (err) => {
+                            console.error(TAG, "error writing file", err);
+                            saveState.unlock();
+                            throw new LokiCordovaFSAdapterError("Unable to write file" + JSON.stringify(err));
+                        }
+                    );
+                },
+                (err) => {
+                    console.error(TAG, "error getting file", err);
+                    saveState.unlock();
+                    throw new LokiCordovaFSAdapterError("Unable to get file" + JSON.stringify(err));
+                }
+            );
+        }
     }
 
     loadDatabase(dbname, callback) {
